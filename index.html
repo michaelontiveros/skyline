@@ -1,0 +1,757 @@
+<!doctype html>
+
+<html>
+  <body>
+    <h1     id = 'header'></h1>
+    <canvas id = 'canvas' width = '1024' height = '512'></canvas>
+		<script type = 'module'>
+		 
+//                  SKYLINE
+// vvvvvvvvvvvvvvvv.global numerical variables and constants.vvvvvvvvvvvvvvvv
+
+			var   lat   =   40.090;           //   moab  latitude
+			var   lon   = -105.28;            //   moab longitude
+			var   dir   =   -1.95;            //  -pi < dir  < pi
+			var   zoom  =   13;               //   0  < zoom < 16
+		  var   x,    y;                    // slippy map  floating point coordinates
+			var   xint, yint;                 // middle tile integer        coordinates
+			var   pos;                        //    0 < x, y  < 1
+    	var   scale;                      //    0 < scale depends on lat and zoom
+      var   count = 0;                  // count frames
+			var   previoustime = Date.now( ); // what was the time COUNT frames ago
+      var   fps   = 0;                  // frames       per second
+      var   ms    = 0;                  // milliseconds per frame
+      var   shift = false;              // keep track of the shift key
+			var   zkey  = false;              // keep track of the z     key
+
+      const X        = 1024;            // the map   is        X x X        pixels
+			const TILERES  = 256;             // the tiles are     256 x 256      pixels
+			const MAPTILES = X / TILERES;     // the map   is MAPTILES x MAPTILES tiles 
+			const LOGX     = Math.log2( X );
+      const NEAR     = 0.04;            //    0 < near
+			const FAR      = 0.9;             //        near  < far
+			const ANGLE    = 3.14159 / 6;     //    0 < angle < pi
+			const U8       = 'rgba8unorm';    // map texture data type
+			const U32      = 'rgba32uint';    // data buffer data type
+			const COUNT    = 10;              // look at the time after COUNT many frames 
+			const COMMANDS = 1;               // do the entire computation multiple times per frame
+			const S2MS     = 1000;            // 1 second = 1000 milliseconds
+
+			const UNIFORMBUFFERSIZE = 4 * 4;
+			const   POSOFFSET       = 0;
+			const   DIROFFSET       = 2;
+			const SCALEOFFSET       = 3;
+      const uniformvalues     = new Float32Array( UNIFORMBUFFERSIZE / 4 );
+
+// vvvvvvvvvvvvvvvvvvvvvvvvvv.connect the gpu and screen.vvvvvvvvvvvvvvvvvvvvvv
+
+    	const adapter = await navigator.gpu?.requestAdapter( );
+			const device  = await       adapter?.requestDevice( );
+			if ( !device )
+			{
+        fail( 'no webgpu' );
+			}
+      const header  = document.getElementById( 'header' );
+			const canvas  = document.getElementById( 'canvas' );
+			const context =   canvas.getContext(     'webgpu' );
+			context.configure
+			(
+        {
+          device : device,
+					format : navigator.gpu.getPreferredCanvasFormat( ),
+				}
+			);
+
+// vvvvvvvvvvvvvvvvvvvvvv.make a little vertex buffer.vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
+
+      const VERTICES = new Float32Array // two triangles share an edge to form a square
+			(
+			  [
+          -1, -1, 
+				   1, -1,
+				  -1,  1,
+
+				  -1,  1,
+					 1, -1,
+					 1,  1,
+			  ]
+			);
+      const vertexbufferlayout = 
+			{
+        arrayStride : 8,
+				attributes  :
+			  [
+          {
+            format         : 'float32x2',
+						offset         : 0,
+						shaderLocation : 0
+					}
+				],
+			};
+      const vertexbuffer = device.createBuffer
+			(
+        {
+          label : 'vertex buffer',
+					size  : VERTICES.byteLength,
+					usage : GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+				}
+			);
+      device.queue.writeBuffer( vertexbuffer, 0, VERTICES );
+		
+// vvvvvvvvvvvvvvvv.make the uniform and data buffers, and the textures.vvvvvvvvvvvvvvvvvvvvvvvv
+
+      const uniformbuffer = device.createBuffer
+	    (
+        {
+          label : 'uniform buffer',
+					size  : UNIFORMBUFFERSIZE,
+				  usage : GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+			  }
+		  );
+	
+			const maptexture = device.createTexture
+			(
+        {
+          label  : 'map texture',
+					format :  U8,
+					size   : [ X, X ],
+					usage  : GPUTextureUsage.TEXTURE_BINDING  |
+					         GPUTextureUsage.COPY_DST         |
+						  		 GPUTextureUsage.RENDER_ATTACHMENT,
+				}
+			);
+ 
+      const anglebuffer = device.createBuffer
+			(
+        {
+          label : 'angle buffer',
+					size  : X * X * 4, // u32 per pixel
+				  usage : GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+				}
+			);
+
+      const posbuffer = device.createBuffer
+			(
+        {
+          label : 'position buffer',
+					size  : X * X * 8, // vec2u per pixel
+				  usage : GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+				}
+			);
+
+      const skylinebuffer = device.createBuffer
+			(
+        {
+          label : 'skyline buffer',
+					size  : X * 16, // vec4u per pixel
+				  usage : GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+				}
+			);
+
+// vvvvvvvvvvvvvvvvvvv.make the bindgroups.vvvvvvvvvvvvvvvvvvvvvvvvvvvvv
+
+      const bindgrouplayout = device.createBindGroupLayout
+			(
+        {
+          entries :
+					[
+						{
+              binding    : 0,
+							visibility : GPUShaderStage.COMPUTE | GPUShaderStage.FRAGMENT,
+              buffer     : {       type : 'uniform' }
+						},
+            {
+              binding    : 1,
+							visibility : GPUShaderStage.COMPUTE | GPUShaderStage.FRAGMENT,
+						  texture    : { sampleType :   'float' }
+						},
+            {
+              binding    : 2,
+							visibility : GPUShaderStage.COMPUTE | GPUShaderStage.FRAGMENT,
+						  buffer     : {       type : 'storage' }
+						},
+            {
+              binding    : 3,
+							visibility : GPUShaderStage.COMPUTE | GPUShaderStage.FRAGMENT,
+						  buffer     : {       type : 'storage' }
+						},
+            {
+              binding    : 4,
+							visibility : GPUShaderStage.COMPUTE | GPUShaderStage.FRAGMENT,
+						  buffer     : {       type : 'storage' }
+						},
+          ]
+				}
+			);
+
+			const bindgroup = device.createBindGroup
+			(
+        {
+          layout : bindgrouplayout,
+				  entries :
+				  [
+				    { binding : 0, resource : { buffer : uniformbuffer } },
+				    { binding : 1, resource :   maptexture.createView( ) },
+				    { binding : 2, resource : { buffer :   anglebuffer } },
+				    { binding : 3, resource : { buffer :     posbuffer } },
+				    { binding : 4, resource : { buffer : skylinebuffer } },
+				  ],
+			  }
+		  );
+
+			const pipelinelayout = device.createPipelineLayout
+			(
+        {
+          bindGroupLayouts : [ bindgrouplayout ],
+				}
+			);
+
+// vvvvvvvvvvvvvvvvvvvvvvvvvvvvvv.make the shaders.vvvvvvvvvvvvvvvvvvvvvvvvvvvvv
+
+//    the angle shader calculates elevation angles in the frustum on the map and writes them in the data buffer
+      const angleshader = device.createShaderModule
+			(
+			  {
+          label : 'angle shader',
+					code :
+					`
+            struct Observer
+						{
+              pos   : vec2f,
+							dir   : f32,
+							scale : f32,
+						};
+
+            const PI     = 3.1415926;
+            const BASIS  = vec4f( 1.0, 1.0 / 256, 1.0 / 65536, 0.0 );
+						const X      = ${ X }f;
+						const Xu     = ${ X }u;
+						const PREC   = 65536.0;
+						const HEIGHT = 0.001; 
+            const NEAR   = ${ NEAR };
+						const FAR    = ${ FAR };
+						const ANGLE  = ${ ANGLE };
+
+            @group( 0 ) @binding( 0 ) var<uniform>                    my : Observer;
+						@group( 0 ) @binding( 1 ) var                            map : texture_2d< f32 >;
+						@group( 0 ) @binding( 2 ) var<storage, read_write> angledata : array<   u32 >;
+						@group( 0 ) @binding( 3 ) var<storage, read_write>   posdata : array< vec2u >;
+						@group( 0 ) @binding( 4 ) var<storage, read_write>      line : array< vec4u >;
+						
+						@compute 
+						@workgroup_size( 8, 8 ) 
+						fn cs( @builtin( global_invocation_id ) thread : vec3u )
+						{
+						
+						  let t           = vec2f( f32( thread.x ), f32( thread.y ) );
+							let p           = 1 - ( t + 0.5 ) / X;
+							let r           = ( FAR - NEAR ) * p.y + NEAR;
+						  let theta       = my.dir - 2 * ANGLE * ( p.x - 0.5 );
+							let mappos      = saturate( r * vec2f( cos( theta ), sin( theta ) ) + my.pos );
+							
+							let color       = textureLoad( map, vec2u( mappos * X ), 0 );
+							let mycolor     = textureLoad( map, vec2u( my.pos * X ), 0 );
+					    
+							let elevation   = dot(   color, BASIS );
+							let myelevation = dot( mycolor, BASIS ) + HEIGHT;
+							let numerator   = ( elevation - myelevation ) * PREC;
+							let denominator =  length( mappos - my.pos ) * my.scale / 10;
+							let angle       = atan( numerator / denominator ) / PI + 0.5;
+              
+							let index       = thread.y + thread.x * Xu;
+							let posu        = vec2u( mappos * PREC );
+							let angleu      =   u32(  angle * PREC ); 
+							
+							angledata[ index ] = angleu;
+							  posdata[ index ] =   posu;
+						}
+					`
+				}
+			);
+
+//    the max shader calculates the maximum of elevation angles along rays in the frustum centered at the observer
+      const maxshader = device.createShaderModule
+			(
+			  {
+          label : 'max shader',
+					code :
+					`
+            struct Observer
+						{
+              pos   : vec2f,
+							dir   : f32,
+							scale : f32,
+						};
+
+						const STRIDE = 128u;
+            const X      = ${ X }u;
+
+						var< workgroup > maxangle : array<   u32, STRIDE >;
+						var< workgroup > maxpos   : array< vec2u, STRIDE >;
+
+            @group( 0 ) @binding( 0 ) var<uniform>                my : Observer;
+						@group( 0 ) @binding( 1 ) var                        map : texture_2d< f32 >;
+						@group( 0 ) @binding( 2 ) var<storage, read_write> angle : array<   u32 >;
+						@group( 0 ) @binding( 3 ) var<storage, read_write>   pos : array< vec2u >;
+						@group( 0 ) @binding( 4 ) var<storage, read_write>  line : array< vec4u >;
+						
+						@compute 
+						@workgroup_size( STRIDE ) 
+						fn cs
+						( 
+						  @builtin( local_invocation_id ) thread : vec3u, 
+							@builtin(        workgroup_id )  group : vec3u  
+						)
+						{
+							let t = thread.x;
+							let g =  group.x;
+							maxangle[ t ] = angle[ t + g * X ];
+							maxpos[   t ] =   pos[ t + g * X ];
+							for( var j = 1u; j < X; j+= STRIDE )
+							{
+                let a = angle[ t + j + g * X ];
+								let p =   pos[ t + j + g * X ];
+								maxangle[ t ] = max(  maxangle[ t ], a );
+								maxpos[   t ] = select( maxpos[ t ], p, maxangle[ t ] == a );
+							}
+							workgroupBarrier( );
+							for( var j = STRIDE >> 1; j > 0; j >>= 1 )
+							{
+                if( t < j )
+								{
+                  let a = maxangle[ t + j ];
+								  let p = maxpos[   t + j ];
+								  maxangle[ t ] = max(  maxangle[ t ], a );
+								  maxpos[   t ] = select( maxpos[ t ], p, maxangle[ t ] == a );
+								}
+								workgroupBarrier( );
+							}
+              if( t == 0 )
+							{
+								line[ g ] = vec4u( maxpos[ t ], maxangle[ t ], 1 );
+							}
+            }
+					`
+				}
+			);
+
+//    the screen shader draws the map and the skyline
+      const screenshader = device.createShaderModule
+			(
+        {
+          label : 'screen shader',
+					code  :
+					`
+            struct Pixel
+						{
+							@builtin( position ) clip : vec4f,
+							@location( 0 )       pos  : vec2f,
+						};
+
+            struct Observer
+						{
+              pos   : vec2f,
+							dir   : f32,
+							scale : f32,
+						};
+
+						const PI    = 3.1415926;
+						const C     = 1.0 / 65536;
+						const X     = ${ X }f;
+						const RED   = vec4f( 1,  0,  0,  1 );
+						const WHITE = vec4f( 1,  1,  1,  1 );
+						const BLACK = vec4f( 0,  0,  0,  1 );
+            const MINUS = vec2f( -1, 1 );
+            const NEAR   = ${ NEAR };
+						const FAR    = ${ FAR };
+						const ANGLE  = ${ ANGLE };
+
+            @group( 0 ) @binding( 0 ) var<uniform>                my : Observer;
+						@group( 0 ) @binding( 1 ) var                        map : texture_2d<f32>;
+						@group( 0 ) @binding( 2 ) var<storage, read_write> angle : array<   u32 >;
+						@group( 0 ) @binding( 3 ) var<storage, read_write>   pos : array< vec2u >;
+						@group( 0 ) @binding( 4 ) var<storage, read_write>  line : array< vec4u >;
+
+						@vertex 
+						fn vs( @location( 0 ) clip : vec2f ) -> Pixel
+						{
+							var pixel : Pixel;
+							pixel.clip  = vec4f(  clip, 1, 1 );
+							pixel.pos   = 0.5 * ( clip + vec2f( 1, 1 ) );
+							pixel.pos.y = 1 - pixel.pos.y;
+							return pixel;
+						}
+						
+						@fragment 
+						fn fs( pixel : Pixel ) -> @location( 0 ) vec4f
+						{
+					 		
+							let x        = u32( pixel.pos.x * X );
+							let y        =  1 - pixel.pos.y;
+							let ymax     = f32( line[ x ].z ) * C;
+							let skymask  = step( ymax, y );
+						  let skyline  = select( WHITE, BLACK, skymask == 0 );
+
+							let mappos   = vec2f( 5 * pixel.pos.x - 4, 3 * pixel.pos.y - 2 );                               
+							let diff     =   mappos - my.pos;
+							let len      = length( diff );                             
+							let dir      =    vec2f( sin( my.dir ), -cos( my.dir ) );
+							let mapangle = atan2( dot( diff, dir ), dot( diff, MINUS * dir.yx ) );
+              let xmax     = u32( X * ( -mapangle / ( 2 * ANGLE ) + 0.5 ) );
+
+							let mapdata  = textureLoad( map, vec2u( mappos * X ), 0 );
+							let mapmax   = C * vec2f( line[ xmax ].xy );
+						
+						  let mapmask  = step( 0,      mappos.x ) * step( 0, mappos.y );
+							let fovmask  = step( abs(    mapangle ), ANGLE ) * step( NEAR, len ) * step( len, FAR ) + step( len, 0.007 );
+              let redmask  = step( length( mapmax - mappos ), 0.003 );
+
+              let mapcolor = select( RED,      select( mapdata.grga, mapdata, fovmask == 0 ), redmask == 0 );
+							let    color = select( mapcolor, skyline,                                       mapmask == 0 );
+							
+							return color;
+						  
+						//	return RED;
+						}
+					`
+				}
+			);
+
+// vvvvvvvvvvvvvvvv.make the pipelines.vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
+
+      const anglepipeline = device.createComputePipeline
+			(
+        {
+          label   : 'angle pipeline',
+					layout  : pipelinelayout,
+					compute :
+					{
+            module     : angleshader,
+						entryPoint : 'cs',
+					},
+				}
+			);
+
+      const maxpipeline = device.createComputePipeline
+			(
+        {
+          label   : 'max pipeline',
+					layout  : pipelinelayout,
+					compute :
+					{
+            module     : maxshader,
+						entryPoint : 'cs',
+					},
+				}
+			);
+
+      const screenpipeline = device.createRenderPipeline
+			(
+        {
+          label    : 'screen pipeline',
+					layout   :  pipelinelayout,
+          vertex   :
+					{
+            module     : screenshader,
+						entryPoint : 'vs',
+						buffers    : [ vertexbufferlayout ]
+					},
+					fragment :
+					{
+            module     : screenshader,
+						entryPoint : 'fs',
+						targets    : [ { format : navigator.gpu.getPreferredCanvasFormat( ) } ],
+					},
+				}
+			);
+
+// vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv.run the shaders.vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
+
+			function render( )
+			{
+				
+				for ( let i = 0; i < COMMANDS; i++ )
+				{
+				device.queue.writeBuffer( uniformbuffer, 0, uniformvalues );
+				
+				const encoder = device.createCommandEncoder( );
+				
+				const pass    = encoder.beginComputePass( );
+				
+				pass.setPipeline(     anglepipeline );
+				pass.setBindGroup( 0,     bindgroup );
+				pass.dispatchWorkgroups( X / 8, X / 8 );
+				
+				pass.setPipeline(     maxpipeline );
+			  pass.setBindGroup( 0,   bindgroup );
+				pass.dispatchWorkgroups( X );
+				
+				pass.end( );
+        
+				const screenpass = encoder.beginRenderPass
+				( 
+				  {
+			      colorAttachments :
+				    [ 
+						  {
+				        view       : context.getCurrentTexture( ).createView( ),
+								loadOp     : 'load',
+					      storeOp    : 'store',
+				      } 
+						]
+			    } 
+				);
+	      screenpass.setPipeline(        screenpipeline );
+				screenpass.setBindGroup(    0, bindgroup );
+        screenpass.setVertexBuffer( 0, vertexbuffer );
+				screenpass.setViewport( 0,  0, canvas.width, canvas.height, 0, 1 ),
+				screenpass.draw( VERTICES.length / 2 );
+				screenpass.end( );
+      
+			  const commandbuffer = encoder.finish( );
+				device.queue.submit( [ commandbuffer ] );
+			  }
+       	timer( );
+				header.innerText = 'MS\xa0\xa0\xa0FPS\xa0\xa0\xa0LAT\xa0\xa0\xa0\xa0\xa0\xa0\xa0\xa0LON\xa0\xa0\xa0\xa0\xa0DIR\xa0\xa0\xa0\xa0\xa0\xa0ZOOM\n' 
+				                 +  ms.toPrecision( 3 ) + '\xa0\xa0\xa0' 
+				                 + fps.toPrecision( 3 ) + '\xa0\xa0\xa0' 
+												 + lat.toPrecision( 5 ) + '\xa0\xa0' 
+												 + lon.toPrecision( 5 ) + '\xa0\xa0\xa0\xa0'
+												 + dir.toPrecision( 3 ) + '\xa0\xa0\xa0\xa0\xa0\xa0'
+												 + zoom;
+			  //window.requestAnimationFrame( render );
+			}
+
+// vvvvvvvvvvvvv.load the 256 x 256 terrain tiles from aws and assemble and store them in the X x X map texture.vvvvvvvvvvvv
+
+     async function loadtexture( )
+			{
+        var tiles = await latlon2tiles( );  
+    		await Promise.all
+				( 
+				  tiles.map
+					( 
+					  async tile => 
+						{ 
+					    device.queue.copyExternalImageToTexture
+				      (
+                { source  : tile.image, flipY  : true },
+					      { texture : maptexture, origin : tile.origin },
+					      { width   : TILERES,    height : TILERES },
+				      );
+						}
+					)
+				);
+      	latlon2pos( );
+				lat2scale(  );
+	    }
+			
+			async function latlon2tiles( )
+			{
+    		let tiles   = [ ];
+				let urls    = [ ];
+				let origins = [ ];
+				let indices = [ ];
+				let index   = 0;
+				lon2x( );
+				lat2y( );
+				xint  = Math.ceil( x );
+        yint  = Math.ceil( y );
+				for ( let i = 0; i < MAPTILES; i++ ) 
+				{
+          for ( let j = 0; j < MAPTILES; j++ ) 
+					{
+            const xi = ( ( xint + i - MAPTILES / 2 ) % ( 2 ** zoom ) + 2 ** zoom ) % ( 2 ** zoom );
+            const yj = ( ( yint + j - MAPTILES / 2 ) % ( 2 ** zoom ) + 2 ** zoom ) % ( 2 ** zoom );
+            const url = 'https://s3.amazonaws.com/elevation-tiles-prod/terrarium/' + zoom + '/' + xi + '/' + yj + '.png';
+            const origin = [ TILERES * i, X - TILERES * ( j + 1 ), 0 ];
+						urls.push( url )
+						origins.push( origin );
+						indices.push( index );
+						index++;
+					}
+				};
+				await Promise.all
+				( 
+				  indices.map
+					( 
+					  async index => 
+						{ 
+						  const image = await loadimage( urls[ index ] );
+							tiles[ index ] = { image : image, origin : origins[ index ] };
+						}
+					)
+				);
+        return await tiles;
+			}
+
+      async function loadimage( url )
+			{
+        const res  = await fetch( url );
+				const blob = await res.blob( );
+				return await createImageBitmap( blob, { colorSpaceConversion : 'none' } );
+			}
+
+// vvvvvvvvvvvvvvv.conversion functions setting and relating lat, lon, x, y, pos, scale.vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
+
+      function lon2x( )     { x     = 2 ** zoom * ( lon + 180 ) / 360 }
+			function x2lon( )     { lon   = 360 * x / 2 ** zoom - 180 }
+      function lat2y( )     { y     = 2 ** ( zoom - 1 ) * ( 1 - Math.asinh( Math.tan( Math.PI * lat / 180 ) ) / Math.PI ) }
+			function y2lat( )     { lat   = Math.atan( Math.sinh( Math.PI * ( 1 - y / 2 ** ( zoom - 1 ) ) ) ) * 180 / Math.PI }
+      
+			function lat2scale( ) 
+			{ 
+			  scale = 156543.03 * X * Math.cos( lat / 180 * Math.PI ) / 2 ** zoom; 
+				uniformvalues.set( [ scale ], SCALEOFFSET );
+			}
+
+      function latlon2pos( )
+			{
+		    lon2x( );
+				lat2y( );
+				xint  = Math.ceil( x );
+        yint  = Math.ceil( y );
+        const xfrac = xint - x;
+				const yfrac = yint - y;
+        pos = [ 0.5 - 256 * xfrac / X, 0.5 + 256 * yfrac / X ];
+				uniformvalues.set( pos, POSOFFSET );
+      }
+
+			function pos2latlon( )
+			{
+        x = ( xint - MAPTILES / 2 ) + pos[ 0 ] * MAPTILES; 
+				y = ( yint + MAPTILES / 2 ) - pos[ 1 ] * MAPTILES;
+				y2lat( );
+				x2lon( );
+			}
+			
+// vvvvvvvvvvvvvvvvvvvvvvvvvvv.timing and input/output.vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
+
+			function timer( )
+			{
+    		count++;
+				if ( count % COUNT == 0 )
+				{
+          const currenttime = Date.now( );
+					const elapsedtime = currenttime - previoustime;
+					fps               = COUNT * COMMANDS * S2MS / elapsedtime;
+					ms                = elapsedtime / ( COUNT * COMMANDS );
+					previoustime      = currenttime;
+				}
+			}
+     
+			function keyup( )
+			{
+        switch ( event.keyCode )
+				{
+          case 16: // shift key
+					  shift = false;
+						break;
+					case 90: //     z key
+					  zkey = false;
+						break;
+					default:
+					  break;
+				}
+			}
+
+      async function keydown( )
+			{
+        switch ( event.keyCode )
+				{
+          case 65: //     a key
+					  movepos( -0.01, 0.0 );
+						render( );
+						break;
+					case 68: //     d key
+					  movepos( 0.01, 0.0 );
+						render( );
+            break;
+					case 83: //     s key
+				    movepos( 0.00, 0.01 );
+						render( );
+            break;
+					case 87: //     w key
+					  movepos( 0.00, -0.01 );
+						render( );
+            break;
+					case 73: //     i key
+            if ( zoom < 15 )
+						{
+              zoom++;
+						  await loadtexture( );
+              render( );
+						}
+						break;
+					case 79: //     o key 
+					  if ( zoom > 4 )
+						{
+              zoom--;
+						  await loadtexture( );
+              render( );
+						}
+						break;
+				  case 16: // shift key
+					  shift = true;
+            break;
+					case 90: //     z key
+					  zkey = true;
+						break;
+					default:
+					  break;
+				}
+			}
+
+			function mousemove( )
+			{
+			  if ( !shift ) { return }
+				if ( zkey )   { mouse2dir( ) }
+				else          { mouse2pos( ) }
+        render( );
+			}
+
+      function mousedown( )
+			{
+	     	if ( zkey ) { mouse2dir( ) }
+        else        { mouse2pos( ) }
+        render( );
+		  }
+
+			function mouse2dir( )
+			{
+        const x = 5 * event.offsetX / canvas.width  - pos[ 0 ] - 4;
+				const y = 3 * event.offsetY / canvas.height - pos[ 1 ] - 2;
+				dir = Math.atan2( y, x );
+				uniformvalues.set( [ dir ], DIROFFSET );
+		  }
+
+			function mouse2pos( )
+			{
+  		  const x = 5 * event.offsetX / canvas.width  - 4;
+				const y = 3 * event.offsetY / canvas.height - 2;
+				pos = [ x, y ];
+				uniformvalues.set( pos, POSOFFSET );
+				pos2latlon( );
+		  }
+
+      function movepos( dx, dy )
+			{
+     		pos[ 0 ] += dx;
+				pos[ 1 ] += dy;
+				uniformvalues.set( pos, POSOFFSET );
+				pos2latlon( );
+			}
+
+// vvvvvvvvvvvvvvvvvvv.run the program.vvvvvvvvvvvvvvvvvvvvvvvvvv
+
+			uniformvalues.set( [ dir ], DIROFFSET );
+			await loadtexture( );
+			window.addEventListener( 'keyup',     keyup );
+			window.addEventListener( 'keydown',   keydown );
+      canvas.addEventListener( 'mousemove', mousemove ); 
+      canvas.addEventListener( 'mousedown', mousedown ); 
+			render( );
+		
+		</script>
+	</body>
+</html>
